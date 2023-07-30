@@ -230,13 +230,13 @@ if __name__ == '__main__':
                 )
             print(train_res)
 
-            # test_s_t = time()
-            # recall = topk_eval(model, train_cf, test_cf)
-            # test_e_t = time()
-            # train_res = PrettyTable()
-            # train_res.field_names = ["Recall@5", "Recall@10", "Recall@20", "Recall@50", "Recall@100"]
-            # train_res.add_row(recall)
-            # print(train_res)
+            test_s_t = time()
+            recall = topk_eval(model, train_cf, test_cf)
+            test_e_t = time()
+            train_res = PrettyTable()
+            train_res.field_names = ["Recall@5", "Recall@10", "Recall@20", "Recall@50", "Recall@100"]
+            train_res.add_row(recall)
+            print(train_res)
 
             # *********************************************************
             # early stopping when cur_best_pre_0 is decreasing for ten successive steps.

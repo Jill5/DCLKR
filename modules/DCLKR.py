@@ -111,12 +111,12 @@ class GraphConv(nn.Module):
 
         self.dropout = nn.Dropout(p=mess_dropout_rate)
 
-    def _edge_sampling(self, edge_index, edge_type, rate=0.5):
+    def _edge_sampling(self, edge_index, edge_type, kg_score, rate=0.5):
         # edge_index: [2, -1]
         # edge_type: [-1]
         n_edges = edge_index.shape[1]
         random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
-        return edge_index[:, random_indices], edge_type[random_indices]
+        return edge_index[:, random_indices], edge_type[random_indices], kg_score[random_indices]
     
     def _sparse_dropout(self, x, rate=0.5):
         noise_shape = x._nnz()
@@ -133,18 +133,18 @@ class GraphConv(nn.Module):
         out = torch.sparse.FloatTensor(i, v, x.shape).to(x.device)
         return out * (1. / (1 - rate))
 
-    def forward(self, entity_emb, relation_emb, edge_index, edge_type, 
+    def forward(self, entity_emb, relation_emb, edge_index, edge_type, kg_score,
                 mess_dropout=True, node_dropout=False):
 
         """node dropout"""
         if node_dropout:
-            edge_index, edge_type = self._edge_sampling(edge_index, edge_type, self.node_dropout_rate)
+            edge_index, edge_type, kg_score = self._edge_sampling(edge_index, edge_type, kg_score, self.node_dropout_rate)
 
         entity_res_emb = entity_emb
 
-        head, tail = edge_index
-        kg_score = torch.sum(entity_emb[head] * relation_emb[edge_type - 1] * entity_emb[tail], dim=-1)
-        kg_score = scatter_softmax(src=kg_score, index=head, dim=0)
+        # head, tail = edge_index
+        # kg_score = torch.sum(entity_emb[head] * relation_emb[edge_type - 1] * entity_emb[tail], dim=-1)
+        # kg_score = scatter_softmax(src=kg_score, index=head, dim=0)
 
         for i in range(len(self.convs)):
             entity_emb = self.convs[i](entity_emb, relation_emb, kg_score, edge_index, edge_type)
@@ -170,10 +170,9 @@ class Recommender(nn.Module):
         self.n_entities = data_config['n_entities']  # include items
         self.n_nodes = data_config['n_nodes']  # n_users + n_entities
 
-        self.alpha1 = args_config.alpha1
-        self.alpha2 = args_config.alpha2
+        self.lambda1 = args_config.lambda1
+        self.lambda2 = args_config.lambda2
         self.decay = args_config.l2
-        self.sim_decay = args_config.sim_regularity
         self.emb_size = args_config.dim
         self.context_hops = args_config.context_hops
         self.node_dropout = args_config.node_dropout
@@ -188,8 +187,6 @@ class Recommender(nn.Module):
         user_embed = initializer(torch.empty(self.n_users, self.emb_size))
         entity_embed = initializer(torch.empty(self.n_entities, self.emb_size))
         relation_embed = initializer(torch.empty(self.n_relations - 1, self.emb_size))
-        latent_embed = initializer(torch.empty(self.n_factors, self.emb_size))
-        latent_weight = initializer(torch.empty(self.n_factors, self.emb_size, self.emb_size))
 
         if args_config.pretrain == 1:
             pretrain_data = torch.load(args_config.data_path + args_config.model_path)
@@ -202,8 +199,6 @@ class Recommender(nn.Module):
         self.user_embed = nn.Parameter(user_embed)
         self.entity_embed = nn.Parameter(entity_embed)
         self.relation_embed = nn.Parameter(relation_embed)
-        self.latent_embed = nn.Parameter(latent_embed)
-        self.latent_weight = nn.Parameter(latent_weight)
 
         self.edge_index, self.edge_type = self._get_edges(graph)
         # interact_mat = self._convert_sp_mat_to_sp_tensor(interact_mat).to(self.device)
@@ -276,35 +271,17 @@ class Recommender(nn.Module):
         z2 = F.normalize(z2)
         return torch.mm(z1, z2.t())
 
-    def _create_graph_contrastive_loss(self, emb_1, emb_2, idx):
+    def _create_graph_contrastive_loss(self, emb):
         # first calculate the sim rec
         tau = 0.6    # default = 0.8
         f = lambda x: torch.exp(x / tau)
         
-        emb_c1 = emb_1[idx]
-        emb_c2 = emb_2[idx]
-        pos = f(self._pos_sim(emb_c1, emb_c2)).diag()
-        neg_1 = f(self._neg_sim(emb_c1, emb_c2))
-        neg_2 = f(self._neg_sim(emb_c2, emb_c1))
-        loss_1 = - torch.log(pos / neg_1)
-        loss_2 = - torch.log(pos / neg_2)
+        emb = self.fc1(emb)
+        pos = f(self._pos_sim(emb, emb)).diag()
+        neg = f(self._neg_sim(emb, emb))
+        loss = - torch.log(pos / neg)
 
-        ret = loss_1 + loss_2
-        ret = ret.mean()
-        return ret
-    
-    def _create_graph_contrastive_loss2(self, emb_1):
-        # first calculate the sim rec
-        tau = 0.6    # default = 0.8
-        f = lambda x: torch.exp(x / tau)
-        
-        emb_1 = self.fc1(emb_1)
-        pos = f(self._pos_sim(emb_1, emb_1)).diag()
-        neg_1 = f(self._neg_sim(emb_1, emb_1))
-        loss_1 = - torch.log(pos / neg_1)
-
-        ret = loss_1
-        ret = ret.mean()
+        ret = loss.mean()
         return ret
     
     def _create_view_contrastive_loss(self, emb_list1, emb_list2, idx):
@@ -325,6 +302,7 @@ class Recommender(nn.Module):
         return ret
     
     def _create_bpr_loss(self, users, items, scores, labels, contra_loss_g, contra_loss_v):
+        scores[scores > 1] = scores[scores > 1] - 0.000001
         batch_size = scores.shape[0]
         criteria = nn.BCELoss()
         bce_loss = criteria(scores, labels.float())
@@ -333,7 +311,7 @@ class Recommender(nn.Module):
                        + torch.norm(items) ** 2) / 2
         emb_loss = self.decay * regularizer / batch_size
         # contra
-        contra_loss = self.alpha1 * contra_loss_g + self.alpha2 * contra_loss_v
+        contra_loss = self.lambda1 * contra_loss_g + self.lambda2 * contra_loss_v
         
         return bce_loss + emb_loss + contra_loss, scores, bce_loss, emb_loss, \
                 contra_loss_g, contra_loss_v
@@ -359,6 +337,10 @@ class Recommender(nn.Module):
         self.mapped_user_embs = torch.stack(user_emb_list, dim=1)
         self.mapped_entity_embs = torch.stack(entity_emb_list, dim=1)
 
+        head, tail = self.edge_index
+        kg_score = torch.sum(self.mapped_entity_embs[head] * self.mapped_relations_embs[self.edge_type - 1] * self.mapped_entity_embs[tail], dim=-1)
+        self.kg_score = nn.Softmax(dim=1)(kg_score)
+
         for i in range(self.n_factors):
             entity_cf_emb, user_cf_emb = self.light_gcn_list[i](self.mapped_user_embs[:,i,:],
                                                                 self.mapped_entity_embs[:,i,:],
@@ -370,6 +352,7 @@ class Recommender(nn.Module):
                                             self.mapped_relations_embs[:,i,:],
                                             self.edge_index,
                                             self.edge_type,
+                                            self.kg_score[:,i],
                                             mess_dropout=self.mess_dropout,
                                             node_dropout=self.node_dropout)
             
@@ -387,14 +370,25 @@ class Recommender(nn.Module):
         i_e_kg = entity_kg_embs[item]
 
         # predict
-        u_e = torch.concat((u_e_cf, u_e_cf), dim=-1)
-        i_e = torch.concat((i_e_cf, i_e_kg), dim=-1)
-        scores = torch.mean(torch.sigmoid(torch.sum(u_e * i_e, dim=-1)), dim=-1)
+        u_e = u_e_cf
+        i_e = i_e_cf + i_e_kg
+        # u_e = torch.concat((u_e_cf, u_e_cf), dim=-1)
+        # i_e = torch.concat((i_e_cf, i_e_kg), dim=-1)
+        scores = torch.sigmoid(torch.sum(u_e * i_e, dim=-1))
+        att = nn.Softmax(dim=1)(torch.multiply(
+            torch.sum(self.user_embed[user] * self.entity_embed[item], dim=-1, keepdim=True),
+            torch.sum(self.mapped_user_embs[user] * self.mapped_entity_embs[item], dim=-1)
+        ))
+        scores = torch.sum(att * scores, dim=1)
+        # scores = torch.mean(torch.sigmoid(torch.sum(u_e * i_e, dim=-1)), dim=-1)
 
         # disentangled contrastive loss
-        contra_loss_g = self._create_graph_contrastive_loss2(self.mapped_relations_embs)
-        contra_loss_g += self._create_graph_contrastive_loss2(self.mapped_user_embs)
-        contra_loss_g += self._create_graph_contrastive_loss2(self.mapped_entity_embs)
+        # contra_loss_g = self._create_graph_contrastive_loss(self.mapped_relations_embs)
+        # contra_loss_g += self._create_graph_contrastive_loss(self.mapped_user_embs)
+        # contra_loss_g += self._create_graph_contrastive_loss(self.mapped_entity_embs)
+        contra_loss_g = self._create_graph_contrastive_loss(entity_cf_embs)
+        contra_loss_g += self._create_graph_contrastive_loss(user_cf_embs)
+        contra_loss_g += self._create_graph_contrastive_loss(entity_kg_embs)
       
         # cross-view contrastive loss
         contra_loss_v = self._create_view_contrastive_loss(self.entity_cf_emb_list, self.entity_kg_emb_list, item)
@@ -417,6 +411,10 @@ class Recommender(nn.Module):
         self.mapped_user_embs = torch.stack(user_emb_list, dim=1)
         self.mapped_entity_embs = torch.stack(entity_emb_list, dim=1)
 
+        head, tail = self.edge_index
+        kg_score = torch.sum(self.mapped_entity_embs[head] * self.mapped_relations_embs[self.edge_type - 1] * self.mapped_entity_embs[tail], dim=-1)
+        self.kg_score = nn.Softmax(dim=1)(kg_score)
+
         for i in range(self.n_factors):
             entity_cf_emb, user_cf_emb = self.light_gcn_list[i](self.mapped_user_embs[:,i,:],
                                                                 self.mapped_entity_embs[:,i,:],
@@ -428,6 +426,7 @@ class Recommender(nn.Module):
                                             self.mapped_relations_embs[:,i,:],
                                             self.edge_index,
                                             self.edge_type,
+                                            self.kg_score[:,i],
                                             mess_dropout=False,
                                             node_dropout=False)
             
@@ -439,8 +438,10 @@ class Recommender(nn.Module):
         user_cf_embs = torch.stack(self.user_cf_emb_list, dim=1)
         entity_kg_embs = torch.stack(self.entity_kg_emb_list, dim=1)
 
-        entity_embs = torch.concat((entity_cf_embs, entity_kg_embs), dim=-1)
-        user_embs = torch.concat((user_cf_embs, user_cf_embs), dim=-1)
+        # entity_embs = torch.concat((entity_cf_embs, entity_kg_embs), dim=-1)
+        # user_embs = torch.concat((user_cf_embs, user_cf_embs), dim=-1)
+        entity_embs = entity_cf_embs + entity_kg_embs
+        user_embs = user_cf_embs
         return entity_embs, user_embs
     
     def generate_scores(self, batch, entity_embs, user_embs):
@@ -450,14 +451,20 @@ class Recommender(nn.Module):
 
         u_e = user_embs[user]
         i_e = entity_embs[item]
-        scores = torch.mean(torch.sigmoid(torch.sum(u_e * i_e, dim=-1)), dim=-1)
+        scores = torch.sigmoid(torch.sum(u_e * i_e, dim=-1))
+        att = nn.Softmax(dim=1)(torch.multiply(
+            torch.sum(self.user_embed[user] * self.entity_embed[item], dim=-1, keepdim=True),
+            torch.sum(self.mapped_user_embs[user] * self.mapped_entity_embs[item], dim=-1)
+        ))
+        scores = torch.sum(att * scores, dim=1)
+        # scores = torch.mean(torch.sigmoid(torch.sum(u_e * i_e, dim=-1)), dim=-1)
         return scores
     
     def update_interact_mats(self):
         user, item = self.interaction[0], self.interaction[1]
         score_list = []
         for i in range(self.n_factors):
-            scores = torch.sum(self.user_cf_emb_list[i][user] * self.entity_kg_emb_list[i][item], dim=-1)
+            scores = torch.sum(self.mapped_user_embs[user,i,:] * self.entity_kg_emb_list[i][item], dim=-1)
             score_list.append(scores)
         scores = torch.stack(score_list, dim=1)
         scores = nn.Softmax(dim=1)(scores)
