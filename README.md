@@ -1,5 +1,9 @@
 # DCLKR
 
+This is our Pytorch implementation for the paper:
+
+> Shuhua Huang, Chenhao Hu, Weiyang Kong, and Yubao Liu. Disentangled Contrastive Learning for Knowledge-aware Recommender System. In ISWC'23.
+
 ## Introduction
 
 DCLKR is a disentangled contrastive learning framework for knowledge-aware recommendation, which consists of three main components: (1) Knowledge Graph Disentangling Module, (2) Interaction Graph Disentangling Module, (3) Contrastive Learning Module.
